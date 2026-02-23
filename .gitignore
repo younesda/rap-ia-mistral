@@ -1,3 +1,13 @@
-.env
-__pycache__/
-*.pyc
+# Backend
+backend/.env
+backend/__pycache__/
+backend/*.pyc
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local
+
+# OS
+.DS_Store
+Thumbs.db
