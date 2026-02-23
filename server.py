@@ -1,17 +1,19 @@
 """
-RapGenius AI - Backend Python avec LangChain (LCEL) et Ollama
-API REST pure pour le frontend Lovable
+RapGenius AI - Agent IA avec recherche web (DuckDuckGo) + Ollama
+LangChain 1.x / LangGraph - create_agent API
+Restricted to rap, hip-hop and their cultural influences only.
 """
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 import os
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_core.chat_history import InMemoryChatMessageHistory
-from langchain_ollama import ChatOllama
 import json
+from langchain_ollama import ChatOllama
+from langchain.agents import create_agent
+from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.memory import MemorySaver
 
 load_dotenv()
 
@@ -21,6 +23,8 @@ CORS(app)
 OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
 OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'gpt-oss:120b-cloud')
 print(f"[OK] Modele: {OLLAMA_MODEL} | URL: {OLLAMA_BASE_URL}")
+
+# --- Chargement des prompts ---
 
 def load_prompts():
     prompt_file = os.path.join(os.path.dirname(__file__), 'prompt.txt')
@@ -32,46 +36,63 @@ def load_prompts():
             return prompts
         except (UnicodeDecodeError, json.JSONDecodeError):
             continue
-    print(f"[ERREUR] Impossible de lire {prompt_file}")
+    print("[ERREUR] Impossible de lire prompt.txt")
     exit(1)
 
 MODES_PROMPTS = load_prompts()
 
-# Stockage des historiques de conversation par session (LCEL)
-store = {}
+# --- Outils & mémoire ---
 
-def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
-    if session_id not in store:
-        store[session_id] = InMemoryChatMessageHistory()
-    return store[session_id]
+search_tool = DuckDuckGoSearchRun(name="recherche_web")
+tools = [search_tool]
 
-def get_llm():
-    return ChatOllama(
-        model=OLLAMA_MODEL,
-        base_url=OLLAMA_BASE_URL,
-        temperature=0.7,
-        num_predict=2000,
-    )
+# Mémoire partagée (LangGraph checkpointer)
+# thread_id = f"{session_id}_{mode}" pour isoler chaque session/mode
+memory = MemorySaver()
 
-def create_chain(mode: str):
-    """Crée une chaîne LCEL avec mémoire pour un mode donné"""
-    mode_info = MODES_PROMPTS.get(mode, MODES_PROMPTS['general'])
-    system_prompt = mode_info['system_prompt']
+# Cache d'agents par mode (un agent par mode, mémoire partagée via thread_id)
+agent_cache: dict = {}
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        MessagesPlaceholder(variable_name="history"),
-        ("human", "{input}")
-    ])
+TOPIC_GUARD = """\
+RÈGLE ABSOLUE : Tu réponds UNIQUEMENT aux questions liées au rap, au hip-hop, \
+et à leurs influences sur d'autres domaines (sport, football, basketball, \
+mode, politique, langage, verlan, art, cinéma, gaming, entrepreneuriat, etc.). \
+Pour toute autre question hors sujet, refuse poliment en une phrase et \
+redirige vers ton domaine d'expertise.
 
-    chain = prompt | get_llm()
+Tu as accès à un outil de recherche web. Utilise-le pour toute information \
+récente : nouveaux albums, actualités d'artistes, classements, événements, \
+collaborations récentes, influences culturelles actuelles, etc.
 
-    return RunnableWithMessageHistory(
-        chain,
-        get_session_history,
-        input_messages_key="input",
-        history_messages_key="history"
-    )
+CONCISION : Sois direct et percutant. Maximum 150-200 mots par réponse. \
+Pas de grands tableaux ni de listes exhaustives sauf si explicitement demandé. \
+Va à l'essentiel, cite 2-3 exemples concrets, conclus en une phrase.
+
+Réponds toujours en français.\
+"""
+
+def get_agent(mode: str):
+    """Retourne l'agent pour un mode donné (créé une seule fois)."""
+    if mode not in agent_cache:
+        mode_info = MODES_PROMPTS.get(mode, MODES_PROMPTS['general'])
+        system_prompt = f"{TOPIC_GUARD}\n\n---\n\n{mode_info['system_prompt']}"
+
+        llm = ChatOllama(
+            model=OLLAMA_MODEL,
+            base_url=OLLAMA_BASE_URL,
+            temperature=0.7,
+            num_predict=600,
+        )
+
+        agent_cache[mode] = create_agent(
+            model=llm,
+            tools=tools,
+            system_prompt=system_prompt,
+            checkpointer=memory,
+        )
+        print(f"[NEW] Agent cree pour le mode '{mode}'")
+
+    return agent_cache[mode]
 
 # --- Routes API ---
 
@@ -81,7 +102,9 @@ def health_check():
         'status': 'ok',
         'model': OLLAMA_MODEL,
         'ollama_url': OLLAMA_BASE_URL,
-        'backend': 'Python + LangChain LCEL + Ollama'
+        'mode': 'agent',
+        'tools': ['DuckDuckGoSearch'],
+        'backend': 'Python + LangChain 1.x Agent + Ollama'
     })
 
 @app.route('/api/modes', methods=['GET'])
@@ -112,17 +135,17 @@ def chat():
         if not user_message:
             return jsonify({'error': 'Aucun message utilisateur trouvé'}), 400
 
-        # Clé unique par session + mode
-        conv_key = f"{session_id}_{mode}"
+        thread_id = f"{session_id}_{mode}"
+        print(f"\n[AGENT] Mode: {mode} | Thread: {thread_id}")
+        print(f"[AGENT] Message: {user_message[:80]}...")
 
-        print(f"[AI] Mode: {mode} | Session: {conv_key}")
-        chain = create_chain(mode)
-        result = chain.invoke(
-            {"input": user_message},
-            config={"configurable": {"session_id": conv_key}}
+        agent = get_agent(mode)
+        result = agent.invoke(
+            {"messages": [HumanMessage(content=user_message)]},
+            config={"configurable": {"thread_id": thread_id}}
         )
 
-        response_text = result.content
+        response_text = result["messages"][-1].content
         print(f"[OK] Reponse: {len(response_text)} caracteres")
 
         return jsonify({
@@ -138,21 +161,9 @@ def chat():
 
 @app.route('/api/clear', methods=['POST'])
 def clear_conversation():
-    try:
-        data = request.json
-        session_id = data.get('session_id', 'default')
-        mode = data.get('mode')
-
-        if mode:
-            store.pop(f"{session_id}_{mode}", None)
-        else:
-            for key in [k for k in store if k.startswith(f"{session_id}_")]:
-                del store[key]
-
-        return jsonify({'status': 'ok'})
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    # MemorySaver ne supporte pas la suppression de thread.
+    # Le frontend génère un nouveau session_id pour repartir de zéro.
+    return jsonify({'status': 'ok'})
 
 # --- Erreurs globales ---
 
@@ -168,8 +179,11 @@ def handle_exception(e):
 
 if __name__ == '__main__':
     PORT = int(os.getenv('PORT', 3000))
-    print(f'\n{"="*50}')
-    print(f'RapGenius AI — API sur http://localhost:{PORT}')
-    print(f'Modele: {OLLAMA_MODEL} | Ollama: {OLLAMA_BASE_URL}')
-    print(f'{"="*50}\n')
+    print(f'\n{"="*55}')
+    print(f'RapGenius AI — Agent IA sur http://localhost:{PORT}')
+    print(f'Modele : {OLLAMA_MODEL} | Ollama : {OLLAMA_BASE_URL}')
+    print(f'Outils : DuckDuckGo Search')
+    print(f'Memoire: LangGraph MemorySaver (par thread_id)')
+    print(f'Restriction : Rap & Hip-Hop uniquement')
+    print(f'{"="*55}\n')
     app.run(host='0.0.0.0', port=PORT, debug=os.getenv('ENV') != 'production')
