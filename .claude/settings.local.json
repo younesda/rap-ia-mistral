@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl:*)",
+      "Bash(ls -la /tmp/rapgenius.log 2>&1 && jobs 2>&1)",
+      "Bash(head:*)",
+      "Bash(grep:*)",
+      "Bash(echo {\"messages\":[{\"role\":\"user\",\"content\":\"Explique le triplet flow en rap.\"}],\"mode\":\"technique\",\"session_id\":\"test_session_2\"}:*)"
+    ]
+  }
+}

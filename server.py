@@ -1,5 +1,5 @@
 """
-RapGenius AI - Backend Python avec LangChain et Ollama
+RapGenius AI - Backend Python avec LangChain (LCEL) et Ollama
 API REST pure pour le frontend Lovable
 """
 
@@ -7,10 +7,10 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 import os
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_ollama import ChatOllama
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationChain
 import json
 
 load_dotenv()
@@ -24,9 +24,7 @@ print(f"[OK] Modele: {OLLAMA_MODEL} | URL: {OLLAMA_BASE_URL}")
 
 def load_prompts():
     prompt_file = os.path.join(os.path.dirname(__file__), 'prompt.txt')
-    encodings = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252']
-
-    for encoding in encodings:
+    for encoding in ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252']:
         try:
             with open(prompt_file, 'r', encoding=encoding) as f:
                 prompts = json.load(f)
@@ -34,12 +32,18 @@ def load_prompts():
             return prompts
         except (UnicodeDecodeError, json.JSONDecodeError):
             continue
-
     print(f"[ERREUR] Impossible de lire {prompt_file}")
     exit(1)
 
 MODES_PROMPTS = load_prompts()
-conversations = {}
+
+# Stockage des historiques de conversation par session (LCEL)
+store = {}
+
+def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
+    if session_id not in store:
+        store[session_id] = InMemoryChatMessageHistory()
+    return store[session_id]
 
 def get_llm():
     return ChatOllama(
@@ -49,23 +53,24 @@ def get_llm():
         num_predict=2000,
     )
 
-def create_conversation_chain(mode):
+def create_chain(mode: str):
+    """Crée une chaîne LCEL avec mémoire pour un mode donné"""
     mode_info = MODES_PROMPTS.get(mode, MODES_PROMPTS['general'])
     system_prompt = mode_info['system_prompt']
 
-    prompt_template = ChatPromptTemplate.from_messages([
+    prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
         MessagesPlaceholder(variable_name="history"),
         ("human", "{input}")
     ])
 
-    memory = ConversationBufferMemory(return_messages=True, memory_key="history")
+    chain = prompt | get_llm()
 
-    return ConversationChain(
-        llm=get_llm(),
-        memory=memory,
-        prompt=prompt_template,
-        verbose=False
+    return RunnableWithMessageHistory(
+        chain,
+        get_session_history,
+        input_messages_key="input",
+        history_messages_key="history"
     )
 
 # --- Routes API ---
@@ -76,7 +81,7 @@ def health_check():
         'status': 'ok',
         'model': OLLAMA_MODEL,
         'ollama_url': OLLAMA_BASE_URL,
-        'backend': 'Python + LangChain + Ollama'
+        'backend': 'Python + LangChain LCEL + Ollama'
     })
 
 @app.route('/api/modes', methods=['GET'])
@@ -100,24 +105,28 @@ def chat():
         if not messages:
             return jsonify({'error': 'Messages requis'}), 400
 
-        conv_key = f"{session_id}_{mode}"
-        if conv_key not in conversations:
-            conversations[conv_key] = create_conversation_chain(mode)
-
         user_message = next(
             (m['content'] for m in reversed(messages) if m.get('role') == 'user'),
             None
         )
-
         if not user_message:
             return jsonify({'error': 'Aucun message utilisateur trouvé'}), 400
 
-        print(f"[AI] Mode: {mode} | Session: {session_id}")
-        response = conversations[conv_key].predict(input=user_message)
-        print(f"[OK] Reponse: {len(response)} caracteres")
+        # Clé unique par session + mode
+        conv_key = f"{session_id}_{mode}"
+
+        print(f"[AI] Mode: {mode} | Session: {conv_key}")
+        chain = create_chain(mode)
+        result = chain.invoke(
+            {"input": user_message},
+            config={"configurable": {"session_id": conv_key}}
+        )
+
+        response_text = result.content
+        print(f"[OK] Reponse: {len(response_text)} caracteres")
 
         return jsonify({
-            'response': response,
+            'response': response_text,
             'mode': mode,
             'session_id': session_id
         })
@@ -135,11 +144,10 @@ def clear_conversation():
         mode = data.get('mode')
 
         if mode:
-            conv_key = f"{session_id}_{mode}"
-            conversations.pop(conv_key, None)
+            store.pop(f"{session_id}_{mode}", None)
         else:
-            for key in [k for k in conversations if k.startswith(f"{session_id}_")]:
-                del conversations[key]
+            for key in [k for k in store if k.startswith(f"{session_id}_")]:
+                del store[key]
 
         return jsonify({'status': 'ok'})
 
@@ -161,7 +169,7 @@ def handle_exception(e):
 if __name__ == '__main__':
     PORT = int(os.getenv('PORT', 3000))
     print(f'\n{"="*50}')
-    print(f'RapGenius AI — API démarrée sur http://localhost:{PORT}')
+    print(f'RapGenius AI — API sur http://localhost:{PORT}')
     print(f'Modele: {OLLAMA_MODEL} | Ollama: {OLLAMA_BASE_URL}')
     print(f'{"="*50}\n')
     app.run(host='0.0.0.0', port=PORT, debug=os.getenv('ENV') != 'production')
